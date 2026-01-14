@@ -1,0 +1,1043 @@
+---
+title: "allofus-HIV-cohort-definitions"
+output: html_document
+date: "2026-01-08"
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE)
+```
+
+
+# Load packages
+```{r}
+# install.packages(c("tidyverse", "allofus", "gt", "ggvenn", "ggh4x", "ggplot2"))
+
+library(allofus)
+library(tidyverse)
+library(gt)
+library(ggvenn)
+library(ggh4x)
+library(ggplot2)
+```
+
+# Connecting to the allofus database
+```{r connection}
+con <- allofus::aou_connect()
+```
+# Once connected you can begin to Create the  Cohorts
+# Creating HIV cohorts using survey data, condition_occurrence data, and drug_data
+
+
+
+#Survey Cohort
+
+# Have you ever been diagnosed with the following conditions? - HIV/AIDS
+# https://athena.ohdsi.org/search-terms/terms/1384391
+```{r}
+svy = aou_survey(questions = 1384391) %>%
+    filter(infectiousdiseasecondition_hivaids_yes == "Yes") %>% # only Yes responses
+    select(person_id) %>%
+    mutate(svy = "s") # create a variable indicating that it was from the survey data.
+
+# preview results
+tally(svy) # size of cohort
+```
+
+
+## Condition cohort ##
+
+# Code to extract people with HIV (except HIV negative (code is above))
+# Concept IDs in the vector(where are they found)
+# Human immunodeficiency virus carrier(pheno lib + AoU Data brow), Human immunodeficiency virus II infection(pheno lib + AoU Data brow), HIV positive(AoU Data brow), Human immunodeficiency virus infection(pheno lib + AoU Data brow)
+# https://data.ohdsi.org/PhenotypeLibrary/
+```{r}
+hiv_ancestors <- c(44783356, 4013106, 432554, 439727)
+hiv_cond_concepts <- tbl(con, "concept_ancestor") %>%
+    filter(ancestor_concept_id %in% hiv_ancestors) %>%
+    distinct(descendant_concept_id)
+
+# confirmed ancestors are included
+hiv_cond_concepts %>% filter(descendant_concept_id %in% hiv_ancestors)
+
+#Code to extract people with HIV Concept ID + descendant
+cond <- tbl(con, "condition_occurrence") %>%
+    inner_join(hiv_cond_concepts, by = join_by(condition_concept_id == descendant_concept_id)) %>%
+    distinct(person_id) %>%
+    mutate(cond = "c") # from the condition table
+tally(cond) # size of cohort
+```
+
+
+## Drug cohort ##
+
+# Drug list was developed from the HIV drugs and then by mapping to all descendents and
+# examined by hand with Chelsea/Brianne to make sure it includes only desired drugs
+# Saved file to github to be read into allofus
+# Load drug lists
+```{r}
+HIV_Drugs <- read.csv("https://raw.githubusercontent.com/plummern/EHR_DRUGS/main/HIV_Drugs_Descendants_FINAL.csv")
+new <- read.csv("https://raw.githubusercontent.com/plummern/AoU_EHR_data/refs/heads/main/NEW%20method%20with%20J05_AoU%20drugs%20compared%20with%20Brianne's%20HIV%20drug%20list.csv")
+reviewed_drug <- read.csv("https://raw.githubusercontent.com/plummern/AoU_EHR_data/refs/heads/main/drugs_only_in_new_BOM_REVIEWED.csv")
+
+# Standardize concept_code type across all
+HIV_Drugs <- HIV_Drugs %>% mutate(concept_code = as.character(concept_code))
+new <- new %>% mutate(concept_code = as.character(concept_code))
+reviewed_drug <- reviewed_drug %>% mutate(concept_code = as.character(concept_code))
+
+# Combine lists
+combined_drugs <- bind_rows(HIV_Drugs, new, reviewed_drug)
+
+# Filter final drug list
+drugs <- combined_drugs %>%
+  filter(drugs_to_keep == 1) %>%
+  select(concept_id) %>%
+  distinct()
+
+# Temp table for join
+hiv_drug_concepts <- allofus::aou_create_temp_table(data = drugs)
+
+# Get unique people with matching HIV drugs
+drug <- tbl(con, "drug_exposure") %>%
+  inner_join(hiv_drug_concepts, by = join_by(drug_concept_id == concept_id)) %>%
+  distinct(person_id) %>%
+  mutate(drug = "d")
+
+# Count how many individuals matched
+drug %>% tally()
+```
+
+
+## Viral Load (VL) cohort ##
+```{r}
+loincs <- tbl(con, "concept") %>% 
+    filter(domain_id == "Measurement",
+           vocabulary_id == "LOINC",
+           concept_class_id == "Lab Test") %>% 
+    collect()
+ 
+hivs_VL <- loincs %>% 
+    filter(str_detect(concept_name, "^HIV"),
+           str_detect(concept_name, "viral load"))
+
+# Extract relevant concept_ids for HIV viral load measurements and Remove duplicate person_ids from the vl dataset
+VL_concept_ids <- hivs_VL$concept_id
+
+vl <- tbl(con, "measurement") %>%
+    filter(measurement_concept_id %in% VL_concept_ids) %>% 
+    inner_join(tbl(con, "concept"), by = c("measurement_concept_id" = "concept_id")) %>%
+    distinct(person_id, .keep_all = TRUE) %>%  # Keep only one entry per person_id
+    distinct(person_id) %>%
+    mutate(vl = "v")
+
+# View the cleaned dataset without NA values in value_as_number
+tally(vl)
+```
+
+
+## Join Together ##
+```{r}
+# NA values will indicate that the person_id did not show up for that cohort. 
+all = full_join(svy, cond, by = join_by("person_id")) %>%
+    full_join(drug, by = join_by("person_id")) %>%
+    full_join(vl, by = join_by("person_id")) %>%
+    collect()
+# preview increased from 9,299 to 9,463 once viral load was joined to the HIV cohort
+tally(all)
+```
+
+# replace NA with blanks so that we can combined the columns into the combination of s, c, d, vl
+# then change NA values to 0
+```{r}
+cohorts = all %>% 
+    replace_na(list(svy = "", cond = "", drug = "", vl = "")) %>%  # Replace NA with blanks
+    unite(cohorts, c("svy", "cond", "drug", "vl"), sep = "", remove = FALSE) %>%  # Combine columns into one          
+    mutate(across(c("svy", "cond", "drug", "vl"), ~ifelse(!is.na(.x) & !.x=="", 1, 0)))
+count(cohorts, cohorts)
+```
+# Adding Demographics
+```{r}
+# Write the cohorts table to a temp table to use on the db level
+all_tbl = allofus::aou_create_temp_table(cohorts, nchar_batch = 1e+04)
+# Demographic variables from chelsea. We'll only use a subset of these
+
+demo <- read.csv("https://raw.githubusercontent.com/cnwong/AoU_FI/main/demo_vars.csv")
+#Applying the aou_surevey demo info to 
+aou_data <- aou_survey(
+    all_tbl,
+    questions = demo$concept_id,
+    question_output = demo$demo,)
+```
+
+# age_at_consent from cb_search_person is actually the date individuals consented to contribute EHR data
+# its not the age at which they enrolled in the study
+# see https://docs.google.com/spreadsheets/d/1XLVq84LLd0VZMioF2sPwyiaPw3EFp5c8o1CTWGPH-Yc/edit?pli=1#gid=183931508
+```{r}
+aou_data_demo = aou_data %>%
+  mutate(
+      race_cat = case_when(
+          race == "White" ~ "White",
+          race == "Black" ~ "Black",
+          race == "Hispanic" ~ "Hispanic/Latino",
+          race %in% c("Asian","NHPI","MENA","RaceEthnicityNoneOfThese") ~ "Other",
+          #race == "MENA" ~ "Other",
+          #race ==  ~ "Other",
+          race %in% c("Skip", "PreferNotToAnswer") ~ "Skip",
+          race %in% c("Hispanic,MENA,White","Black,NHPI","Hispanic,White","Black,White","Asian,White",
+                     "MENA,White","Asian,Hispanic", "Black,Hispanic","Hispanic,MENA", "NHPI,White", "Asian,Black",
+                     "Black,Hispanic,MENA,White","Hispanic,NHPI,White","Black,Hispanic,MENA,NHPI","Asian,MENA,White",
+                     "Black,Hispanic,White","Asian,Black,Hispanic,White","Asian,Hispanic,White","Black,MENA", "Asian,Black,White",
+                     "Asian,NHPI,White","Black,Hispanic,MENA","Asian,MENA","Asian,Black,NHPI", "Black,MENA,White", "Hispanic,NHPI",
+                     "MENA,NHPI,White","Black,NHPI,White","Asian,NHPI","Asian,Black,MENA,White","Asian,Hispanic,MENA,White",
+                     "Black,MENA,NHPI","Asian,Black,NHPI,White", "Asian,Black,Hispanic", "Asian,Black,Hispanic,MENA,White", 
+                     "Asian,Hispanic,NHPI,White","Hispanic,MENA,NHPI", "Asian,Hispanic,MENA,NHPI", "MENA,NHPI", "Black,MENA,NHPI,White",
+                     "Asian,Hispanic,NHPI","Asian,Black,Hispanic,NHPI,White","Black,Hispanic,NHPI","Asian,Black,Hispanic,MENA",
+                     "Black,Hispanic,NHPI,White","Asian,Black,MENA") ~ "Mixed"
+     ),
+  sex_birth_cat = case_when(
+              sex_birth == "Male" ~ "Male",
+              sex_birth == "Female" ~ "Female",
+              sex_birth %in% c ("Intersex","SexAtBirthNoneOfThese") ~ "Diverse",
+              sex_birth %in% c("Skip", "PreferNotToAnswer") ~ "Skip",
+            TRUE ~ NA_character_
+        ),
+        sex_birth_bin = case_when(
+              sex_birth == "Male" ~ 0,
+              sex_birth == "Female" ~ 1,
+              sex_birth %in% c ("Intersex","SexAtBirthNoneOfThese") ~ 2,
+              sex_birth %in% c("Skip", "PreferNotToAnswer") ~  NA_real_,
+              TRUE ~ NA_real_
+        ),
+        gender_cat = case_when(
+              gender=="Man" ~ "Man",
+              gender == "Woman" ~ "Woman",
+              gender %in% c("NonBinary","AdditionalOptions","Transgender","NonBinary,Woman", "Man,NonBinary",
+                        "Man,Transgender","Man,Woman","Transgender,Woman","AdditionalOptions,Woman",
+                        "Man,NonBinary,Transgender,Woman","NonBinary,Transgender","NonBinary,Transgender,Woman",
+                        "Man,NonBinary,Woman","AdditionalOptions,Man","Man,Transgender,Woman") ~ "Diverse",
+              gender %in% c("Skip", "PreferNotToAnswer") ~ "Skip",
+            TRUE ~ NA_character_
+        ),
+          gender_bin = case_when(
+              gender=="Man" ~ 0,
+              gender == "Woman" ~ 1,
+              gender %in% c("NonBinary","AdditionalOptions","Transgender","NonBinary,Woman", "Man,NonBinary",
+                                "Man,Transgender","Man,Woman","Transgender,Woman","AdditionalOptions,Woman",
+                                "Man,NonBinary,Transgender,Woman","NonBinary,Transgender","NonBinary,Transgender,Woman",
+                                "Man,NonBinary,Woman","AdditionalOptions,Man","Man,Transgender,Woman") ~ 2,
+              gender %in% c("Skip", "PreferNotToAnswer") ~  NA_real_,
+              TRUE ~ NA_real_
+        ),
+  gender_sex_cat = case_when(
+      is.na(sex_birth_cat) & is.na(gender_cat) ~ NA_character_,
+      gender_cat == "Diverse" ~ "Gender Diverse",
+      sex_birth_cat == "Diverse" ~ "Gender Diverse",
+      sex_birth_cat == "Male" & gender_cat == "Woman" ~ "Gender Diverse",
+      sex_birth_cat == "Female" & gender_cat == "Man" ~ "Gender Diverse",
+      sex_birth_cat == "Male" & gender_cat == "Man" ~ "Male",
+      sex_birth_cat == "Female" & gender_cat == "Woman" ~ "Female",
+      sex_birth_cat == "Skip" | gender_cat == "Skip" ~ NA_character_)) %>%
+distinct( # we only need these columns
+    person_id,
+    race, race_cat,
+    sex_birth, sex_birth_cat, sex_birth_bin,
+    gender,gender_cat, gender_bin,
+    gender_sex_cat
+) %>%
+    # a not ideal way to get age. 
+  left_join(tbl(con, "cb_search_person") %>% select(person_id, age_at_consent, has_ehr_data),
+            by = join_by(person_id))
+```
+
+# edited the age groups after reviewing the national data
+# this would change the levels to be what we want to see
+# appending the name of the data with _c to indicate that it's been collected. 
+
+# Collecting demographic data and processing it
+```{r}
+aou_data_demo_c <- collect(aou_data_demo) %>%
+    rename(race_eth_cat = race_cat) %>%  # Rename race_cat to race_eth_cat
+    mutate(
+        age_cat = cut(as.numeric(age_at_consent),  # Categorize age into ranges
+                      breaks = c(12, 24, 34, 44, 54, 92),
+                      labels = c("Age 13-24", "Age 25-34", "Age 35-44", "Age 45-54", "Age 55+")),
+        age_cat = fct_relevel(age_cat, "Age 13-24", "Age 25-34", "Age 35-44", "Age 45-54", "Age 55+"),
+        age_flag_65_plus = ifelse(age_at_consent >= 65, "65+", "Under 65"),    # Flag for age 65 and older
+        age_flag_65_plus = fct_relevel(age_flag_65_plus, "Under 65", "65+"),
+        gender_sex_cat = fct_relevel(gender_sex_cat, "Male", "Female", "Gender Diverse"),  # Reorder gender categories
+        race_eth_cat = fct_relevel(race_eth_cat,  # Reorder race/ethnicity categories
+                                   "White", "Black", "Hispanic/Latino", "Mixed", "Other", "Skip")
+    ) %>%
+    select(person_id, age_cat, gender_sex_cat, race_eth_cat, age_at_consent, age_flag_65_plus)  # Select relevant columns
+```
+
+# join the demographic data to the cohorts table 
+# change all character columns to factor
+# preview data to see total sample size.(n = 9,299 7/16/24).. new:(n = 9,998 12/12/24).. newest:(n = 10,022 6/23/25)
+```{r}
+demo_clean = cohorts %>%
+    left_join(aou_data_demo_c, by = "person_id") %>%
+    mutate(across(where(is.character), as.factor)) %>%
+    select(person_id, cohorts, svy, cond, drug, vl, 
+          gender_sex_cat, race_eth_cat, age_cat, age_flag_65_plus)
+```
+
+# Making Summary Data
+
+# getting the counts of each combination for reference later on
+```{r}
+demo_clean %>%
+    summarise(
+    # Individual sources
+    svy = sum(str_detect(cohorts, "s")),
+    cond = sum(str_detect(cohorts, "c")),
+    drug = sum(str_detect(cohorts, "d")),
+    vl = sum(str_detect(cohorts, "v")),
+
+    # Specific combinations
+    svy_and_cond_and_drug_and_vl = sum(
+      str_detect(cohorts, "s") & str_detect(cohorts, "c") & str_detect(cohorts, "d") & str_detect(cohorts, "v")
+    ),
+
+    svy_and_cond_and_drug_or_vl = sum(
+      str_detect(cohorts, "s") & str_detect(cohorts, "c") & (str_detect(cohorts, "d") | str_detect(cohorts, "v"))
+    ),
+
+    svy_and_vl_and_cond_or_drug = sum(
+      str_detect(cohorts, "s") & str_detect(cohorts, "v") & (str_detect(cohorts, "c") | str_detect(cohorts, "d"))
+    ),
+
+    drug_and_vl_and_svy_or_cond = sum(
+      str_detect(cohorts, "d") & str_detect(cohorts, "v") & (str_detect(cohorts, "s") | str_detect(cohorts, "c"))
+    ),
+
+    svy_and_cond_or_drug = sum(
+      str_detect(cohorts, "s") & (str_detect(cohorts, "c") | str_detect(cohorts, "d"))
+    ),
+
+    vl_and_cond_or_drug = sum(
+      str_detect(cohorts, "v") & (str_detect(cohorts, "c") | str_detect(cohorts, "d"))
+    ),
+
+    vl_and_svy_or_drug = sum(
+      str_detect(cohorts, "v") & (str_detect(cohorts, "s") | str_detect(cohorts, "d"))
+    ),
+
+    vl_and_svy_or_cond = sum(
+      str_detect(cohorts, "v") & (str_detect(cohorts, "s") | str_detect(cohorts, "c"))
+    ),
+
+    svy_or_cond_or_drug_or_vl = sum(
+      str_detect(cohorts, "s|c|d|v")
+    ),
+
+    # 1-to-1 pairs and other combinations
+    cond_and_drug = sum(
+      str_detect(cohorts, "c") & str_detect(cohorts, "d")
+    ),
+
+    svy_and_cond = sum(
+      str_detect(cohorts, "s") & str_detect(cohorts, "c")
+    ),
+
+    svy_and_drug = sum(
+      str_detect(cohorts, "s") & str_detect(cohorts, "d")
+    ),
+
+    vl_and_svy = sum(
+      str_detect(cohorts, "v") & str_detect(cohorts, "s")
+    ),
+
+    vl_and_cond = sum(
+      str_detect(cohorts, "v") & str_detect(cohorts, "c")
+    ),
+
+    vl_and_drug = sum(
+      str_detect(cohorts, "v") & str_detect(cohorts, "d")))
+```
+
+
+# We need the size of each cell to calculate proprtion representation within each later on
+# needs to be in long format too
+
+# unique combinations - these are the 'and' denominators 
+```{r}
+ands = demo_clean %>% count(cohorts, name = "total" )
+
+# alls and ors
+alls_ors = demo_clean %>%
+    summarize(svy = sum(str_detect(cohorts, "s")),
+             cond = sum(str_detect(cohorts, "c")),
+             drug = sum(str_detect(cohorts, "d")),
+             vl = sum(str_detect(cohorts, "v")),
+             svy_and_cond_or_drug = sum(
+                str_detect(cohorts, "s") & str_detect(cohorts, "c|d")
+            ),
+            svy_and_cond = sum(
+                str_detect(cohorts, "s") & str_detect(cohorts, "c")
+            ),
+            svy_and_drug = sum(
+                str_detect(cohorts, "s") & str_detect(cohorts, "d")
+            ),
+            cond_and_drug = sum(
+                str_detect(cohorts, "c") & str_detect(cohorts, "d")
+            ),
+            svy_and_cond_and_drug_or_vl = sum(
+                str_detect(cohorts, "s") & str_detect(cohorts, "c") & str_detect(cohorts, "d|v")
+            ),
+            svy_and_vl_and_cond_or_drug = sum(
+                str_detect(cohorts, "s") & str_detect(cohorts, "v") & str_detect(cohorts, "c|d")
+            ),
+            drug_and_vl_and_svy_or_cond = sum(
+                 str_detect(cohorts, "d") & str_detect(cohorts, "v") & str_detect(cohorts, "s|c")
+            ),
+            vl_and_cond_or_drug = sum(
+                str_detect(cohorts, "v") & str_detect(cohorts, "c|d")
+            ),
+            vl_and_svy_or_drug = sum(
+                str_detect(cohorts, "v") & str_detect(cohorts, "s|d")
+            ),
+            vl_and_svy_or_cond = sum(
+                str_detect(cohorts, "v") & str_detect(cohorts, "s|c")
+            ),
+            vl_and_svy = sum(
+                str_detect(cohorts, "v") & str_detect(cohorts, "s")
+            ),
+            vl_and_cond = sum(
+                str_detect(cohorts, "v") & str_detect(cohorts, "c")
+            ),
+            vl_and_drug = sum(
+                str_detect(cohorts, "v") & str_detect(cohorts, "d")
+            ),
+            svy_or_cond_or_drug_or_vl = sum(
+                    str_detect(cohorts, "s|c|d|v")
+                )) %>%
+    pivot_longer(cols = 1:18, names_to = "cohorts", values_to = "total")
+
+nat = tibble(cohorts = "nat", total = 1086806) # nat = national data statistics
+
+
+denominators = 
+    bind_rows(
+      alls_ors, ands, nat)
+```
+
+
+# now we need to calcualte demographics for each cohort/source combination we're interested in
+# first the "and" conditions
+# then the next cell has the "or" conditions
+
+# A bunch of clean up to calculate cell sizes, rename items, and join to denominators
+# done for the ands and the alls/ors separately and then combined. 
+
+# ands
+```{r}
+age = demo_clean %>%
+    count(cohorts, age_cat) %>%
+    left_join(denominators, by = join_by(cohorts)) %>%
+    mutate(variable = "age")%>%
+    rename("cat" = ends_with("cat"))
+
+gender_sex = demo_clean %>%
+    count(cohorts, gender_sex_cat) %>%
+    left_join(denominators, by = join_by(cohorts)) %>%
+    mutate(variable = "gender_sex")%>%
+    rename("cat" = ends_with("cat"))
+
+
+race = demo_clean %>%
+    count(cohorts, race_eth_cat) %>%
+    left_join(denominators, by = join_by(cohorts)) %>%
+    mutate(variable = "race")%>%
+    rename("cat" = ends_with("cat"))
+
+# example preview output
+head(age)
+```
+
+
+# anys ors
+```{r}
+age_any = demo_clean %>%
+    mutate(
+            svy_and_cond_or_drug = ifelse(
+                str_detect(cohorts, "s") & str_detect(cohorts, "c|d"), 1, 0
+            ),
+            svy_and_cond = ifelse(
+                str_detect(cohorts, "s") & str_detect(cohorts, "c"), 1, 0
+            ),
+            svy_and_drug = ifelse(
+                str_detect(cohorts, "s") & str_detect(cohorts, "d"), 1, 0
+            ),
+            cond_and_drug = ifelse(
+                str_detect(cohorts, "c") & str_detect(cohorts, "d"), 1, 0
+            ),
+            svy_and_cond_and_drug_or_vl = ifelse(
+                str_detect(cohorts, "s") & str_detect(cohorts, "c") & str_detect(cohorts, "d|v"), 1, 0
+            ),
+            svy_and_vl_and_cond_or_drug = ifelse(
+                str_detect(cohorts, "s") & str_detect(cohorts, "v") & str_detect(cohorts, "c|d"), 1, 0
+            ),
+            drug_and_vl_and_svy_or_cond = ifelse(
+                 str_detect(cohorts, "d") & str_detect(cohorts, "v") & str_detect(cohorts, "s|c"), 1, 0
+            ),
+            vl_and_cond_or_drug = ifelse(
+                str_detect(cohorts, "v") & str_detect(cohorts, "c|d"), 1, 0
+            ),
+            vl_and_svy_or_drug = ifelse(
+                str_detect(cohorts, "v") & str_detect(cohorts, "s|d"), 1, 0
+            ),
+            vl_and_svy_or_cond = ifelse(
+                str_detect(cohorts, "v") & str_detect(cohorts, "s|c"), 1, 0
+            ),
+            vl_and_svy = ifelse(
+                str_detect(cohorts, "v") & str_detect(cohorts, "s"), 1, 0
+            ),
+            vl_and_cond = ifelse(
+                str_detect(cohorts, "v") & str_detect(cohorts, "c"), 1, 0
+            ),
+            vl_and_drug = ifelse(
+                str_detect(cohorts, "v") & str_detect(cohorts, "d"), 1, 0
+            ),
+            svy_or_cond_or_drug_or_vl = ifelse(
+                    str_detect(cohorts, "s|c|d|v"), 1, 0
+                )) %>%
+    select(person_id, svy:vl,
+           svy_and_cond_or_drug,
+           svy_and_cond, svy_and_drug, cond_and_drug,
+           svy_and_cond_and_drug_or_vl, svy_and_vl_and_cond_or_drug, drug_and_vl_and_svy_or_cond,
+           vl_and_cond_or_drug, vl_and_svy_or_drug, vl_and_svy_or_cond,
+           vl_and_svy, vl_and_cond, vl_and_drug,
+           svy_or_cond_or_drug_or_vl,
+           ends_with("cat")) %>%
+    pivot_longer(cols = svy:svy_or_cond_or_drug_or_vl, names_to = "cohorts") %>%
+    filter(value == 1) %>%
+    count(age_cat, cohorts) %>%
+    left_join(denominators, by = join_by(cohorts)) %>%
+    mutate(cohorts = case_when(
+        cohorts=="cond" ~ "any_c",
+        cohorts=="svy" ~ "any_s",
+        cohorts=="drug" ~ "any_d",
+        cohorts=="vl" ~ "any_v",
+        TRUE ~ cohorts
+    
+    ),
+        variable = "age"
+    ) %>%
+    rename(cat = age_cat)
+
+gender_sex_any = demo_clean %>%
+    mutate(
+            svy_and_cond_or_drug = ifelse(
+                str_detect(cohorts, "s") & str_detect(cohorts, "c|d"), 1, 0
+            ),
+            svy_and_cond = ifelse(
+                str_detect(cohorts, "s") & str_detect(cohorts, "c"), 1, 0
+            ),
+            svy_and_drug = ifelse(
+                str_detect(cohorts, "s") & str_detect(cohorts, "d"), 1, 0
+            ),
+            cond_and_drug = ifelse(
+                str_detect(cohorts, "c") & str_detect(cohorts, "d"), 1, 0
+            ),
+            svy_and_cond_and_drug_or_vl = ifelse(
+                str_detect(cohorts, "s") & str_detect(cohorts, "c") & str_detect(cohorts, "d|v"), 1, 0
+            ),
+            svy_and_vl_and_cond_or_drug = ifelse(
+                str_detect(cohorts, "s") & str_detect(cohorts, "v") & str_detect(cohorts, "c|d"), 1, 0
+            ),
+            drug_and_vl_and_svy_or_cond = ifelse(
+                 str_detect(cohorts, "d") & str_detect(cohorts, "v") & str_detect(cohorts, "s|c"), 1, 0
+            ),
+            vl_and_cond_or_drug = ifelse(
+                str_detect(cohorts, "v") & str_detect(cohorts, "c|d"), 1, 0
+            ),
+            vl_and_svy_or_drug = ifelse(
+                str_detect(cohorts, "v") & str_detect(cohorts, "s|d"), 1, 0
+            ),
+            vl_and_svy_or_cond = ifelse(
+                str_detect(cohorts, "v") & str_detect(cohorts, "s|c"), 1, 0
+            ),
+            vl_and_svy = ifelse(
+                str_detect(cohorts, "v") & str_detect(cohorts, "s"), 1, 0
+            ),
+            vl_and_cond = ifelse(
+                str_detect(cohorts, "v") & str_detect(cohorts, "c"), 1, 0
+            ),
+            vl_and_drug = ifelse(
+                str_detect(cohorts, "v") & str_detect(cohorts, "d"), 1, 0
+            ),
+            svy_or_cond_or_drug_or_vl = ifelse(
+                    str_detect(cohorts, "s|c|d|v"), 1, 0
+                )) %>%
+    select(person_id, svy:vl,
+           svy_and_cond_or_drug,
+           svy_and_cond, svy_and_drug, cond_and_drug,
+           svy_and_cond_and_drug_or_vl, svy_and_vl_and_cond_or_drug, drug_and_vl_and_svy_or_cond,
+           vl_and_cond_or_drug, vl_and_svy_or_drug, vl_and_svy_or_cond,
+           vl_and_svy, vl_and_cond, vl_and_drug,
+           svy_or_cond_or_drug_or_vl,
+           ends_with("cat")) %>%
+    pivot_longer(cols = svy:svy_or_cond_or_drug_or_vl, names_to = "cohorts") %>%
+    filter(value == 1) %>%
+    count(gender_sex_cat, cohorts) %>%
+    left_join(denominators, by = join_by(cohorts)) %>%
+    mutate(cohorts = case_when(
+        cohorts=="cond" ~ "any_c",
+        cohorts=="svy" ~ "any_s",
+        cohorts=="drug" ~ "any_d",
+        cohorts=="vl" ~ "any_v",
+        TRUE ~ cohorts
+    
+    ),
+        variable = "gender_sex"
+    ) %>%
+    rename(cat = gender_sex_cat)
+
+
+race_any = demo_clean %>%
+    mutate(
+            svy_and_cond_or_drug = ifelse(
+                str_detect(cohorts, "s") & str_detect(cohorts, "c|d"), 1, 0
+            ),
+            svy_and_cond = ifelse(
+                str_detect(cohorts, "s") & str_detect(cohorts, "c"), 1, 0
+            ),
+            svy_and_drug = ifelse(
+                str_detect(cohorts, "s") & str_detect(cohorts, "d"), 1, 0
+            ),
+            cond_and_drug = ifelse(
+                str_detect(cohorts, "c") & str_detect(cohorts, "d"), 1, 0
+            ),
+            svy_and_cond_and_drug_or_vl = ifelse(
+                str_detect(cohorts, "s") & str_detect(cohorts, "c") & str_detect(cohorts, "d|v"), 1, 0
+            ),
+            svy_and_vl_and_cond_or_drug = ifelse(
+                str_detect(cohorts, "s") & str_detect(cohorts, "v") & str_detect(cohorts, "c|d"), 1, 0
+            ),
+            drug_and_vl_and_svy_or_cond = ifelse(
+                 str_detect(cohorts, "d") & str_detect(cohorts, "v") & str_detect(cohorts, "s|c"), 1, 0
+            ),
+            vl_and_cond_or_drug = ifelse(
+                str_detect(cohorts, "v") & str_detect(cohorts, "c|d"), 1, 0
+            ),
+            vl_and_svy_or_drug = ifelse(
+                str_detect(cohorts, "v") & str_detect(cohorts, "s|d"), 1, 0
+            ),
+            vl_and_svy_or_cond = ifelse(
+                str_detect(cohorts, "v") & str_detect(cohorts, "s|c"), 1, 0
+            ),
+            vl_and_svy = ifelse(
+                str_detect(cohorts, "v") & str_detect(cohorts, "s"), 1, 0
+            ),
+            vl_and_cond = ifelse(
+                str_detect(cohorts, "v") & str_detect(cohorts, "c"), 1, 0
+            ),
+            vl_and_drug = ifelse(
+                str_detect(cohorts, "v") & str_detect(cohorts, "d"), 1, 0
+            ),
+            svy_or_cond_or_drug_or_vl = ifelse(
+                    str_detect(cohorts, "s|c|d|v"), 1, 0
+                )) %>%
+    select(person_id, svy:vl,
+           svy_and_cond_or_drug,
+           svy_and_cond, svy_and_drug, cond_and_drug,
+           svy_and_cond_and_drug_or_vl, svy_and_vl_and_cond_or_drug, drug_and_vl_and_svy_or_cond,
+           vl_and_cond_or_drug, vl_and_svy_or_drug, vl_and_svy_or_cond,
+           vl_and_svy, vl_and_cond, vl_and_drug,
+           svy_or_cond_or_drug_or_vl,
+           ends_with("cat")) %>%
+    pivot_longer(cols = svy:svy_or_cond_or_drug_or_vl, names_to = "cohorts") %>%
+    filter(value == 1) %>%
+    count(race_eth_cat, cohorts) %>%
+    left_join(denominators, by = join_by(cohorts)) %>%
+    mutate(cohorts = case_when(
+        cohorts=="cond" ~ "any_c",
+        cohorts=="svy" ~ "any_s",
+        cohorts=="drug" ~ "any_d",
+        cohorts=="vl" ~ "any_v",
+        TRUE ~ cohorts
+    
+    ),
+        variable = "race"
+    ) %>%
+    rename(cat = race_eth_cat)
+```
+
+# combine them all together (stack them)
+```{r}
+aou_dat = bind_rows(age, age_any, gender_sex, gender_sex_any, race, race_any) %>%
+    mutate(prop = n/total)
+
+head(aou_dat)
+```
+
+# creating a dataframe for National data, matching the variables and categories of the AOU HIV data
+
+# Other variable is the sum of prevalence (cases) for Asian + American Indian/Alaska Native + Native Hawaiian/Other Pacific Islander
+# Data comes from here: https://aidsvu.org/resources/#/datasets?years=2021
+# AidsVu uses CDC data with some changes I'm not quite sure about
+```{r}
+nat_dat <- tribble (
+    ~variable, ~cat, ~n, ~total,
+    "gender_sex", "Male", 836283, 1086806,
+    "gender_sex", "Female", 250523, 1086806,
+    "gender_sex", "Skip", 0, 1086806,
+    "race", "Black", 432249, 1086806,
+    "race", "White", 306474, 1086806,
+    "race", "Hispanic/Latino", 270823, 1086806,
+    "race", "Mixed", 55723, 1086806,
+    "race", "Other", 20858, 1086806,
+    "race", "Skip", 0, 1086806,
+    "age", "Age 13-24", 28255, 1086806,
+    "age", "Age 25-34", 164890, 1086806,
+    "age", "Age 35-44", 205530, 1086806,
+    "age", "Age 45-54", 246872, 1086806,
+    "age", "Age 55+", 441259, 1086806,
+) |>
+    mutate(prop = n/total, cohorts = "nat")
+
+# get percentages to verify later
+nat_dat %>% group_by(variable, cat) %>% summarize(tot = sum(prop))
+
+# put the aou and national data together
+plot_dat = bind_rows(aou_dat, nat_dat)
+
+# check unique condition counts
+plot_dat %>% count(cohorts)
+# cell sizes here are ok. A few NA stragglers that are ignorable
+# sd has very small cell counts and is missing some
+```
+
+
+# Creating Proportion demographics by cohort
+
+# Cleaning up variable names for the plot
+```{r}
+study_dat = plot_dat %>%
+    filter(cohorts %in% c("nat", "scdv", "svy_and_cond_and_drug_or_vl", "svy_and_vl_and_cond_or_drug", "drug_and_vl_and_svy_or_cond",
+                          "svy_and_cond_or_drug", "vl_and_cond_or_drug", "vl_and_svy_or_drug", "vl_and_svy_or_cond",
+                          "svy_or_cond_or_drug_or_vl", "any_s", "any_c", "any_d", "any_v",
+                          "cond_and_drug", "svy_and_cond", "svy_and_drug", "vl_and_svy", "vl_and_cond", "vl_and_drug")) %>%
+    mutate(cohort_name = case_when(
+        cohorts == "nat" ~ "national",
+        cohorts == "scdv" ~ "surv & con & drug & vl",
+        cohorts == "svy_and_cond_and_drug_or_vl" ~ "surv & con & drug | vl",
+        cohorts == "svy_and_vl_and_cond_or_drug" ~ "surv & vl & con | drug",
+        cohorts == "drug_and_vl_and_svy_or_cond" ~ "drug & vl & surv | con",
+        cohorts == "svy_and_cond_or_drug" ~ "surv & con | drug",
+        cohorts == "vl_and_cond_or_drug" ~ "vl & con | drug",
+        cohorts == "vl_and_svy_or_drug" ~ "vl & surv | drug",
+        cohorts == "vl_and_svy_or_cond" ~ "vl & surv | con",
+        cohorts == "svy_or_cond_or_drug_or_vl" ~ "surv | con | drug |vl",
+        cohorts == "any_s" ~ "surv",
+        cohorts == "any_c" ~ "con",
+        cohorts == "any_d" ~ "drug",
+        cohorts == "any_v" ~ "vl",
+        cohorts == "cond_and_drug" ~ "con & drug",
+        cohorts == "svy_and_cond" ~ "surv & con",
+        cohorts == "svy_and_drug" ~ "surv & drug",
+        cohorts == "vl_and_svy" ~ "vl & surv",
+        cohorts == "vl_and_cond" ~ "vl & con",
+        cohorts == "vl_and_drug" ~ "vl & drug",
+        TRUE ~ "extra"
+    )) %>%
+    mutate(cohort_name = factor(cohort_name,
+                           levels = c(
+                               "national",
+                               "surv & con & drug & vl",
+                               "surv & con & drug | vl",
+                               "surv & vl & con | drug",
+                               "drug & vl & surv | con",
+                               "surv & con | drug",
+                               "vl & con | drug",
+                               "vl & surv | drug",
+                               "vl & surv | con",
+                               "surv | con | drug |vl",
+                               "surv",
+                               "con",
+                               "drug",
+                               "vl",
+                               "con & drug",
+                               "surv & con",
+                               "surv & drug",
+                               "vl & surv",
+                               "vl & con",
+                               "vl & drug")))
+```
+
+#Age
+
+# plot has to combine first two age groups. 
+# also remove small N's < 20
+```{r}
+demo = "age"
+df_fig2_age = study_dat %>% 
+     filter(variable == !!demo) %>% droplevels() %>%
+     mutate(collapse = case_when(
+         str_detect(cat, "13|25") ~ 0,
+         str_detect(cat, "35") ~ 1,
+         str_detect(cat, "45") ~ 2,
+         str_detect(cat, "55") ~ 3
+         )
+            )%>%
+    group_by(collapse, cohort_name) %>%
+    mutate(
+        n = sum(n), 
+        total = mean(total)) %>%
+    mutate(
+        prop = n/total,
+        cat = ifelse(cat == "Age 25-34", "Age 13-34", cat)) %>%
+    filter(cat != "Age 13-24") %>% droplevels() %>%
+     drop_na(cat) %>%
+     group_by(cohort_name) %>%
+     complete(cat, fill = list(prop = 0, variable = demo)) %>%
+      mutate(prop = ifelse(n<20, NA, prop))
+# options(repr.plot.width = 16, repr.plot.height = 6, repr.plot.res = 200)
+# 
+# # cleaned up plot for poster. 
+# df_fig2_age %>%
+#   ggplot(aes(x = cohort_name, y = prop, fill = cohort_name)) + #, color = color_outline
+#     geom_col(position = "dodge", show.legend = FALSE,
+#              aes(color = ifelse(cohort_name == "national", "black", "white"))) +
+#     scale_color_identity() +
+#    facet_wrap(~ cat, scales = "free_x", ncol = 5) + #  ylim(0, 1) +
+#    theme(axis.text.x = element_blank(),
+#          plot.title = element_text(size = 36, face = "bold", margin = margin(t = 0, r = 15, b = 10, l = 0)),
+#      axis.text = element_blank(),
+#     axis.title.y = element_text(size = 20, margin = margin(t = 0, r = 20, b = 0, l = 0)),
+#      strip.text = element_text(size = 30)) +
+#  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+#  labs(title = paste("Age"),
+#             x = NULL,
+#             y = "Proportion of Participants") + 
+#   force_panelsizes(cols = unit("9", "cm"), total_height = unit("12", "cm"), TRUE)
+```
+
+# Race
+
+# combine other/skip for race...end up not doing this, but it was easier just to filter it out below
+```{r}
+demo = "race"
+df_fig2_race = study_dat %>% 
+    filter(variable == !!demo) %>% droplevels() %>%
+    mutate(cat = ifelse(str_detect(cat,"Other|Skip"), "Other/Skip", cat)) %>%
+    group_by(cat, cohort_name) %>%
+    mutate(
+        n = sum(n), 
+        total = mean(total),
+        prop = n/total) %>%
+       # cat = ifelse(cat == "Age 25-34", "Age 13-34", cat)) %>%
+     distinct() %>%
+     drop_na(cat) %>%
+     group_by(cohort_name) %>%
+     complete(cat, fill = list(prop = 0, variable = demo)) %>%
+     mutate(cat = factor(cat, levels = c("Black", "White", "Hispanic/Latino", "Mixed", "Other/Skip"))) %>%
+    mutate(prop = ifelse(n<20, NA, prop))
+# df_fig2_race %>%
+#     filter(cat != "Other/Skip") %>%
+#   ggplot(aes(x = cohort_name, y = prop, fill = cohort_name)) + #, color = color_outline
+#     geom_col(position = "dodge", show.legend = FALSE,
+#              aes(color = ifelse(cohort_name == "national", "black", "white"))) +
+#     scale_color_identity() +
+#    facet_wrap(~ cat, scales = "free_x", ncol = 5) +
+#    theme(axis.text.x = element_blank(),
+#          plot.title = element_text(size = 36, face = "bold", margin = margin(t = 0, r = 15, b = 10, l = 0)),
+#      axis.text = element_blank(),
+#      #axis.title.x = element_text(size = 14),
+#      axis.title.y = element_text(size = 20, margin = margin(t = 0, r = 20, b = 0, l = 0)),
+#      #legend.text = element_text(size = 14),
+#      #legend.title = element_text(size = 14),
+#      #legend.position = "bottom",
+#      strip.text = element_text(size = 30)) +
+#  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+#  labs(title = paste("Race"),
+#             x = NULL,
+#             y = "Proportion of Participants") + 
+#   force_panelsizes(cols = unit("9", "cm"), total_height = unit("12", "cm"), TRUE)
+```
+
+
+# Gender Sex
+```{r}
+demo = "gender_sex"
+df_fig2_gs = study_dat %>% 
+    filter(cat != "Skip") %>%
+    filter(variable == !!demo) %>% droplevels() %>%
+    #mutate(cat = ifelse(str_detect(cat,"Diverse|Skip")|is.na(cat), "Gender Diverse/Skip", cat)) %>%
+    group_by(cat, cohort_name) %>%
+    mutate(
+        n = sum(n), 
+        total = mean(total),
+        prop = n/total) %>%
+     distinct() %>%
+      drop_na(cat) %>%
+     group_by(cohort_name) %>%
+     complete(cat, fill = list(prop = 0, variable = demo)) %>%
+     mutate(cat = factor(cat, levels = c("Male", "Female", "Gender Diverse"))) %>%
+    mutate(prop = ifelse(n<20, NA, prop))
+# df_fig2_gs %>%
+#   filter(cat != "Skip") %>%
+#   ggplot(aes(x = cohort_name, y = prop, fill = cohort_name)) + #, color = color_outline
+#     geom_col(position = "dodge", show.legend = FALSE,
+#              aes(color = ifelse(cohort_name == "national", "black", "white"))) +
+#     scale_color_identity() +
+#    facet_wrap(~ cat, scales = "free_x", ncol = 5) +
+#    theme(axis.text.x = element_blank(),
+#          plot.title = element_text(size = 36, face = "bold", margin = margin(t = 0, r = 15, b = 10, l = 0)),
+#      axis.text = element_blank(),
+#      #axis.title.x = element_text(size = 14),
+#      axis.title.y = element_text(size = 20, margin = margin(t = 0, r = 20, b = 0, l = 0)),
+#      #legend.text = element_text(size = 14),
+#      #legend.title = element_text(size = 14),
+#      #legend.position = "bottom",
+#      strip.text = element_text(size = 28)) +
+#  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+#  labs(title = paste("Gender Sex"),
+#             x = NULL,
+#             y = "Proportion of Participants") + 
+#   force_panelsizes(cols = unit("8", "cm"), total_height = unit("12", "cm"), TRUE)
+```
+
+# Table 1
+
+to make table 1, we have to adjust some of the level combinations form above
+# then we'll combine the data that went into the plots
+# and feed it to the gt package to make a nice table we can save as a word doc to put it directly in the poster
+```{r}
+demo = "gender_sex"
+df_fig2_gs = study_dat %>% 
+   # filter(cat != "Skip") %>%
+    filter(variable == !!demo) %>% droplevels() %>%
+    mutate(cat = ifelse(is.na(cat), "Skip", cat)) %>%
+    group_by(cat, cohort_name) %>%
+    mutate(
+        n = sum(n), 
+        total = mean(total),
+        prop = n/total) %>%
+     distinct() %>%
+    #  drop_na(cat) %>%
+     group_by(cohort_name) %>%
+     complete(cat, fill = list(prop = 0, variable = demo)) %>%
+     mutate(cat = factor(cat, levels = c("Male", "Female", "Gender Diverse", "Skip"))) %>%
+    mutate(prop = ifelse(n<20, NA, prop))
+
+demo = "race"
+df_fig2_race = study_dat %>% 
+    filter(variable == !!demo) %>% droplevels() %>%
+    mutate(cat = ifelse(str_detect(cat,"Other|Skip"), "Other/Skip", cat)) %>%
+    group_by(cat, cohort_name) %>%
+    mutate(
+        n = sum(n), 
+        total = mean(total),
+        prop = n/total) %>%
+       # cat = ifelse(cat == "Age 25-34", "Age 13-34", cat)) %>%
+     distinct() %>%
+     drop_na(cat) %>%
+     group_by(cohort_name) %>%
+     complete(cat, fill = list(prop = 0, variable = demo)) %>%
+     mutate(cat = factor(cat, levels = c("Black", "White", "Hispanic/Latino", "Mixed", "Other/Skip"))) %>%
+    mutate(prop = ifelse(n<20, NA, prop))
+```
+
+
+``` {r}
+t1 = bind_rows(
+    df_fig2_age, 
+    df_fig2_race,
+    df_fig2_gs
+    ) %>%
+    select(-collapse) %>%
+    mutate(cell_value = ifelse(!is.na(n)& n>=20, paste0(n, " (", round(prop,2)*100, ")"), "<20")) %>%
+    select(-total, -n, -prop) %>%
+    filter(cohorts != "nat") %>% arrange(variable, cohort_name, cat) 
+
+t2 = denominators %>%
+    filter(cohorts != "nat") %>%
+            mutate(
+                  cohorts = case_when(
+                      cohorts == "svy" ~ "any_s",
+                      cohorts == "cond" ~ "any_c",
+                      cohorts == "drug" ~ "any_d",
+                      cohorts == "vl" ~ "any_v",
+                      TRUE ~ cohorts
+                  ),
+                  cell_value = as.character(total),
+                  variable = "cohort total",
+                  cat = "total") %>% select(-total) %>%
+    filter(cohorts %in% c("nat", "scdv", "svy_and_cond_and_drug_or_vl", "svy_and_vl_and_cond_or_drug", "drug_and_vl_and_svy_or_cond",
+                          "svy_and_cond_or_drug", "vl_and_cond_or_drug", "vl_and_svy_or_drug", "vl_and_svy_or_cond",
+                          "svy_or_cond_or_drug_or_vl", "any_s", "any_c", "any_d", "any_v",
+                          "cond_and_drug", "svy_and_cond", "svy_and_drug", "vl_and_svy", "vl_and_cond", "vl_and_drug")) %>%
+    mutate(cohort_name = case_when(
+        cohorts == "nat" ~ "national",
+        cohorts == "scdv" ~ "surv & con & drug & vl",
+        cohorts == "svy_and_cond_and_drug_or_vl" ~ "surv & con & drug | vl",
+        cohorts == "svy_and_vl_and_cond_or_drug" ~ "surv & vl & con | drug",
+        cohorts == "drug_and_vl_and_svy_or_cond" ~ "drug & vl & surv | con",
+        cohorts == "svy_and_cond_or_drug" ~ "surv & con | drug",
+        cohorts == "vl_and_cond_or_drug" ~ "vl & con | drug",
+        cohorts == "vl_and_svy_or_drug" ~ "vl & surv | drug",
+        cohorts == "vl_and_svy_or_cond" ~ "vl & surv | con",
+        cohorts == "svy_or_cond_or_drug_or_vl" ~ "surv | con | drug |vl",
+        cohorts == "any_s" ~ "surv",
+        cohorts == "any_c" ~ "con",
+        cohorts == "any_d" ~ "drug",
+        cohorts == "any_v" ~ "vl",
+        cohorts == "cond_and_drug" ~ "con & drug",
+        cohorts == "svy_and_cond" ~ "surv & con",
+        cohorts == "svy_and_drug" ~ "surv & drug",
+        cohorts == "vl_and_svy" ~ "vl & surv",
+        cohorts == "vl_and_cond" ~ "vl & con",
+        cohorts == "vl_and_drug" ~ "vl & drug",
+        TRUE ~ "extra"
+    )) %>%
+    mutate(cohort_name = factor(cohort_name,
+                           levels = c(
+                               "national",
+                               "surv & con & drug & vl",
+                               "surv & con & drug | vl",
+                               "surv & vl & con | drug",
+                               "drug & vl & surv | con",
+                               "surv & con | drug",
+                               "vl & con | drug",
+                               "vl & surv | drug",
+                               "vl & surv | con",
+                               "surv | con | drug |vl",
+                               "surv",
+                               "con",
+                               "drug",
+                               "vl",
+                               "con & drug",
+                               "surv & con",
+                               "surv & drug",
+                               "vl & surv",
+                               "vl & con",
+                               "vl & drug"
+                           ))) %>%
+     bind_rows(t1) %>%
+     select(-cohorts) %>%
+     pivot_wider(names_from = "cohort_name", values_from = cell_value) %>%
+     select(variable, cat, 'surv & con & drug & vl', 'surv & con & drug | vl', 'surv & vl & con | drug', 'drug & vl & surv | con',
+            'surv & con | drug', 'vl & con | drug', 'vl & surv | drug', 'vl & surv | con', 'surv | con | drug |vl', 'surv',
+            'con', 'drug', 'vl', 'con & drug', 'surv & con', 'surv & drug', 'vl & surv', 'vl & con', 'vl & drug' ) %>%
+    mutate(order = c(0, 1, 2, 3, 4, 5, 7, 8, 6, 8.5, 11, 9, 10, 12)) %>% arrange(order) %>% select(-order)
+    
+#### add back 15 after 14, only if the 45-54, 55+ goups are added back
+
+# preview
+t2
+
+# fix for trying to do gt in jupyter notebooks
+gts <- function(gt_table){
+   gt:::as.tags.gt_tbl(gt_table)
+}
+
+t2 %>% 
+    gt(groupname_col = "variable") %>%
+    gts()
+```
+
+
