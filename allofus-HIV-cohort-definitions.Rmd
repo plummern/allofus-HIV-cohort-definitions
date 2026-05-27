@@ -31,7 +31,6 @@ con <- allofus::aou_connect()
 # Creating HIV cohorts using survey data, condition_occurrence data, and drug_data
 
 
-
 #Survey Cohort
 
 # Have you ever been diagnosed with the following conditions? - HIV/AIDS
@@ -49,8 +48,7 @@ tally(svy) # size of cohort
 
 ## Condition cohort ##
 
-# Code to extract people with HIV (except HIV negative (code is above))
-# Concept IDs in the vector(where are they found)
+# Concept IDs in the vector
 # Human immunodeficiency virus carrier(pheno lib + AoU Data brow), Human immunodeficiency virus II infection(pheno lib + AoU Data brow), HIV positive(AoU Data brow), Human immunodeficiency virus infection(pheno lib + AoU Data brow)
 # https://data.ohdsi.org/PhenotypeLibrary/
 ```{r}
@@ -74,7 +72,7 @@ tally(cond) # size of cohort
 ## Drug cohort ##
 
 # Drug list was developed from the HIV drugs and then by mapping to all descendents and
-# examined by hand with Chelsea/Brianne to make sure it includes only desired drugs
+# examined with Chelsea/Brianne to make sure it includes only desired drugs
 # Saved file to github to be read into allofus
 # Load drug lists
 ```{r}
@@ -122,7 +120,7 @@ hivs_VL <- loincs %>%
     filter(str_detect(concept_name, "^HIV"),
            str_detect(concept_name, "viral load"))
 
-# Extract relevant concept_ids for HIV viral load measurements and Remove duplicate person_ids from the vl dataset
+# Extract relevant concept_ids for HIV viral load measurements and removed duplicate person_ids from the vl dataset
 VL_concept_ids <- hivs_VL$concept_id
 
 vl <- tbl(con, "measurement") %>%
@@ -144,7 +142,7 @@ all = full_join(svy, cond, by = join_by("person_id")) %>%
     full_join(drug, by = join_by("person_id")) %>%
     full_join(vl, by = join_by("person_id")) %>%
     collect()
-# preview increased from 9,299 to 9,463 once viral load was joined to the HIV cohort
+# preview increased from 9,299 to 10,022 once viral load was joined to the HIV cohort
 tally(all)
 ```
 
@@ -157,6 +155,7 @@ cohorts = all %>%
     mutate(across(c("svy", "cond", "drug", "vl"), ~ifelse(!is.na(.x) & !.x=="", 1, 0)))
 count(cohorts, cohorts)
 ```
+
 # Adding Demographics
 ```{r}
 # Write the cohorts table to a temp table to use on the db level
@@ -201,7 +200,7 @@ aou_data_demo = aou_data %>%
               sex_birth == "Female" ~ "Female",
               sex_birth %in% c ("Intersex","SexAtBirthNoneOfThese") ~ "Diverse",
               sex_birth %in% c("Skip", "PreferNotToAnswer") ~ "Skip",
-            TRUE ~ NA_character_
+            TRUE ~ "Skip"
         ),
         sex_birth_bin = case_when(
               sex_birth == "Male" ~ 0,
@@ -218,7 +217,7 @@ aou_data_demo = aou_data %>%
                         "Man,NonBinary,Transgender,Woman","NonBinary,Transgender","NonBinary,Transgender,Woman",
                         "Man,NonBinary,Woman","AdditionalOptions,Man","Man,Transgender,Woman") ~ "Diverse",
               gender %in% c("Skip", "PreferNotToAnswer") ~ "Skip",
-            TRUE ~ NA_character_
+            TRUE ~ "Skip"
         ),
           gender_bin = case_when(
               gender=="Man" ~ 0,
@@ -231,14 +230,15 @@ aou_data_demo = aou_data %>%
               TRUE ~ NA_real_
         ),
   gender_sex_cat = case_when(
-      is.na(sex_birth_cat) & is.na(gender_cat) ~ NA_character_,
       gender_cat == "Diverse" ~ "Gender Diverse",
       sex_birth_cat == "Diverse" ~ "Gender Diverse",
       sex_birth_cat == "Male" & gender_cat == "Woman" ~ "Gender Diverse",
       sex_birth_cat == "Female" & gender_cat == "Man" ~ "Gender Diverse",
       sex_birth_cat == "Male" & gender_cat == "Man" ~ "Male",
       sex_birth_cat == "Female" & gender_cat == "Woman" ~ "Female",
-      sex_birth_cat == "Skip" | gender_cat == "Skip" ~ NA_character_)) %>%
+      sex_birth_cat == "Skip" | gender_cat == "Skip" ~ "Skip"),
+      is.na(sex_birth_cat) & is.na(gender_cat) ~ "Skip",
+      TRUE ~"Skip")) %>%
 distinct( # we only need these columns
     person_id,
     race, race_cat,
@@ -246,7 +246,6 @@ distinct( # we only need these columns
     gender,gender_cat, gender_bin,
     gender_sex_cat
 ) %>%
-    # a not ideal way to get age. 
   left_join(tbl(con, "cb_search_person") %>% select(person_id, age_at_consent, has_ehr_data),
             by = join_by(person_id))
 ```
@@ -261,12 +260,12 @@ aou_data_demo_c <- collect(aou_data_demo) %>%
     rename(race_eth_cat = race_cat) %>%  # Rename race_cat to race_eth_cat
     mutate(
         age_cat = cut(as.numeric(age_at_consent),  # Categorize age into ranges
-                      breaks = c(12, 24, 34, 44, 54, 92),
+                      breaks = c(12, 24, 34, 44, 54, Inf),
                       labels = c("Age 13-24", "Age 25-34", "Age 35-44", "Age 45-54", "Age 55+")),
         age_cat = fct_relevel(age_cat, "Age 13-24", "Age 25-34", "Age 35-44", "Age 45-54", "Age 55+"),
         age_flag_65_plus = ifelse(age_at_consent >= 65, "65+", "Under 65"),    # Flag for age 65 and older
         age_flag_65_plus = fct_relevel(age_flag_65_plus, "Under 65", "65+"),
-        gender_sex_cat = fct_relevel(gender_sex_cat, "Male", "Female", "Gender Diverse"),  # Reorder gender categories
+        gender_sex_cat = fct_relevel(gender_sex_cat, "Male", "Female", "Gender Diverse", "Skip"),  # Reorder gender categories
         race_eth_cat = fct_relevel(race_eth_cat,  # Reorder race/ethnicity categories
                                    "White", "Black", "Hispanic/Latino", "Mixed", "Other", "Skip")
     ) %>%
@@ -275,7 +274,7 @@ aou_data_demo_c <- collect(aou_data_demo) %>%
 
 # join the demographic data to the cohorts table 
 # change all character columns to factor
-# preview data to see total sample size.(n = 9,299 7/16/24).. new:(n = 9,998 12/12/24).. newest:(n = 10,022 6/23/25)
+# preview data to see total sample size.(n = 10,022)
 ```{r}
 demo_clean = cohorts %>%
     left_join(aou_data_demo_c, by = "person_id") %>%
@@ -418,7 +417,6 @@ alls_ors = demo_clean %>%
 
 nat = tibble(cohorts = "nat", total = 1086806) # nat = national data statistics
 
-
 denominators = 
     bind_rows(
       alls_ors, ands, nat)
@@ -445,7 +443,6 @@ gender_sex = demo_clean %>%
     left_join(denominators, by = join_by(cohorts)) %>%
     mutate(variable = "gender_sex")%>%
     rename("cat" = ends_with("cat"))
-
 
 race = demo_clean %>%
     count(cohorts, race_eth_cat) %>%
@@ -678,7 +675,6 @@ head(aou_dat)
 
 # Other variable is the sum of prevalence (cases) for Asian + American Indian/Alaska Native + Native Hawaiian/Other Pacific Islander
 # Data comes from here: https://aidsvu.org/resources/#/datasets?years=2021
-# AidsVu uses CDC data with some changes I'm not quite sure about
 ```{r}
 nat_dat <- tribble (
     ~variable, ~cat, ~n, ~total,
@@ -707,12 +703,10 @@ plot_dat = bind_rows(aou_dat, nat_dat)
 
 # check unique condition counts
 plot_dat %>% count(cohorts)
-# cell sizes here are ok. A few NA stragglers that are ignorable
-# sd has very small cell counts and is missing some
 ```
 
 
-# Creating Proportion demographics by cohort
+# Creating Figure 1: Proportion demographics by cohort
 
 # Cleaning up variable names for the plot
 ```{r}
@@ -769,34 +763,26 @@ study_dat = plot_dat %>%
 ```
 
 #Age
-
-# plot has to combine first two age groups. 
-# also remove small N's < 20
 ```{r}
 demo = "age"
 df_fig2_age = study_dat %>% 
-     filter(variable == !!demo) %>% droplevels() %>%
-     mutate(collapse = case_when(
-         str_detect(cat, "13|25") ~ 0,
-         str_detect(cat, "35") ~ 1,
-         str_detect(cat, "45") ~ 2,
-         str_detect(cat, "55") ~ 3
-         )
-            )%>%
-    group_by(collapse, cohort_name) %>%
-    mutate(
-        n = sum(n), 
-        total = mean(total)) %>%
-    mutate(
-        prop = n/total,
-        cat = ifelse(cat == "Age 25-34", "Age 13-34", cat)) %>%
-    filter(cat != "Age 13-24") %>% droplevels() %>%
-     drop_na(cat) %>%
-     group_by(cohort_name) %>%
-     complete(cat, fill = list(prop = 0, variable = demo)) %>%
-      mutate(prop = ifelse(n<20, NA, prop))
-# options(repr.plot.width = 16, repr.plot.height = 6, repr.plot.res = 200)
-# 
+  filter(variable == !!demo) %>% 
+  droplevels() %>%
+  drop_na(cat) %>%
+  group_by(cat, cohort_name) %>%
+  mutate(
+    n = sum(n),
+    total = mean(total)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    prop = n / total,
+    prop = ifelse(n < 20, NA, prop)  # suppress small cells
+  ) %>%
+  group_by(cohort_name) %>%
+  complete(cat, fill = list(prop = 0, variable = demo)) %>%
+  ungroup()
+
 # # cleaned up plot for poster. 
 # df_fig2_age %>%
 #   ggplot(aes(x = cohort_name, y = prop, fill = cohort_name)) + #, color = color_outline
@@ -817,7 +803,6 @@ df_fig2_age = study_dat %>%
 ```
 
 # Race
-
 # combine other/skip for race...end up not doing this, but it was easier just to filter it out below
 ```{r}
 demo = "race"
@@ -858,7 +843,6 @@ df_fig2_race = study_dat %>%
 #             y = "Proportion of Participants") + 
 #   force_panelsizes(cols = unit("9", "cm"), total_height = unit("12", "cm"), TRUE)
 ```
-
 
 # Gender Sex
 ```{r}
@@ -901,9 +885,10 @@ df_fig2_gs = study_dat %>%
 #   force_panelsizes(cols = unit("8", "cm"), total_height = unit("12", "cm"), TRUE)
 ```
 
+
 # Table 1
 
-to make table 1, we have to adjust some of the level combinations form above
+# to make table 1, we have to adjust some of the level combinations form above
 # then we'll combine the data that went into the plots
 # and feed it to the gt package to make a nice table we can save as a word doc to put it directly in the poster
 ```{r}
@@ -942,15 +927,15 @@ df_fig2_race = study_dat %>%
     mutate(prop = ifelse(n<20, NA, prop))
 ```
 
-
 ``` {r}
 t1 = bind_rows(
     df_fig2_age, 
     df_fig2_race,
     df_fig2_gs
     ) %>%
-    select(-collapse) %>%
-    mutate(cell_value = ifelse(!is.na(n)& n>=20, paste0(n, " (", round(prop,2)*100, ")"), "<20")) %>%
+    #select(-collapse) %>%
+    #mutate(cell_value = ifelse(!is.na(n)& n>=20, paste0(n, " (", round(prop,2)*100, ")"), "<20")) %>% # percentage = (rounded proportion)*100
+    mutate(cell_value = ifelse(!is.na(n)& n>=20, paste0(n, " (", round(prop*100,1), ")"), "<20")) %>% # percentage = (proportion*100), then round
     select(-total, -n, -prop) %>%
     filter(cohorts != "nat") %>% arrange(variable, cohort_name, cat) 
 
@@ -1023,9 +1008,7 @@ t2 = denominators %>%
      select(variable, cat, 'surv & con & drug & vl', 'surv & con & drug | vl', 'surv & vl & con | drug', 'drug & vl & surv | con',
             'surv & con | drug', 'vl & con | drug', 'vl & surv | drug', 'vl & surv | con', 'surv | con | drug |vl', 'surv',
             'con', 'drug', 'vl', 'con & drug', 'surv & con', 'surv & drug', 'vl & surv', 'vl & con', 'vl & drug' ) %>%
-    mutate(order = c(0, 1, 2, 3, 4, 5, 7, 8, 6, 8.5, 11, 9, 10, 12)) %>% arrange(order) %>% select(-order)
-    
-#### add back 15 after 14, only if the 45-54, 55+ goups are added back
+    mutate(order = c(0, 1, 2, 3, 4, 5, 7, 8, 6, 8.5, 11, 9, 10, 12, 16, 13, 14, 15)) %>% arrange(order) %>% select(-order)
 
 # preview
 t2
